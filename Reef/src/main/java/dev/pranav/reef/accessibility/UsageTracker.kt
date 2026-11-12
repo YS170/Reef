@@ -35,6 +35,16 @@ object UsageTracker {
                 "Routine check for $packageName: usage=$usageMs, limit=$limitMs"
             )
 
+            // Keep the "how much longer can I use this app" notification up to date. This is
+            // the one code path that is guaranteed to run on every foreground app check, which
+            // is why the notification is posted from here rather than from window-event code.
+            val remainingMs = (limitMs - usageMs).coerceAtLeast(0L)
+            if (remainingMs > 0L) {
+                NotificationHelper.showBudgetNotification(context, packageName, remainingMs)
+            } else {
+                NotificationHelper.cancelBudgetNotification(context)
+            }
+
             if (limitWarningsEnabled && usageMs >= (limitMs * 0.85) && usageMs < limitMs) {
                 val timeRemaining = limitMs - usageMs
                 NotificationHelper.showReminderNotification(context, packageName, timeRemaining)
