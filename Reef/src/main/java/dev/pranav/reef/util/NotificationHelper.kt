@@ -1,6 +1,7 @@
 package dev.pranav.reef.util
 
 import android.Manifest
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -132,16 +133,23 @@ object NotificationHelper {
     }
 
     /**
-     * Shows (or updates in place) the ongoing "how much longer can I use this app" notification
-     * for [packageName]. Silent, non-dismissible by the user, refreshed roughly once a minute by
-     * BlockerService.
+     * Builds the ongoing "how much longer can I use this app" notification for [packageName],
+     * or returns null when notifications are not permitted.
+     *
+     * Building is separated from posting because [dev.pranav.reef.accessibility.BlockerService]
+     * promotes this notification to a foreground-service notification, which the system then
+     * keeps alive (that is the only reliable way to survive MIUI/HyperOS notification cleanup).
      */
-    fun showBudgetNotification(context: Context, packageName: String, remainingMs: Long) {
+    fun buildBudgetNotification(
+        context: Context,
+        packageName: String,
+        remainingMs: Long
+    ): Notification? {
         if (ActivityCompat.checkSelfPermission(
                 context,
                 Manifest.permission.POST_NOTIFICATIONS
             ) != PackageManager.PERMISSION_GRANTED
-        ) return
+        ) return null
 
         val appName = try {
             context.packageManager.getApplicationLabel(
@@ -154,7 +162,7 @@ object NotificationHelper {
         // Round up: while there is still time left, never show "0 minutes".
         val minutes = ((remainingMs + 59_999L) / 60_000L).toInt()
 
-        val notification = NotificationCompat.Builder(context, ROUTINE_BUDGET_CHANNEL_ID)
+        return NotificationCompat.Builder(context, ROUTINE_BUDGET_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(appName)
             .setContentText("本段还能玩 $minutes 分钟")
@@ -163,8 +171,13 @@ object NotificationHelper {
             .setSilent(true)
             .setShowWhen(false)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
+    }
 
+    /** Shows (or updates in place) the ongoing "how much longer can I use this app" notification. */
+    fun showBudgetNotification(context: Context, packageName: String, remainingMs: Long) {
+        val notification = buildBudgetNotification(context, packageName, remainingMs) ?: return
         NotificationManagerCompat.from(context)
             .notify(ROUTINE_BUDGET_NOTIFICATION_ID, notification)
     }
