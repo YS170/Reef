@@ -70,10 +70,12 @@ object NotificationHelper {
                 setBypassDnd(true)
             }
         )
-        // Silent (no sound, no heads-up), but at DEFAULT importance so that MIUI/HyperOS
-        // does not fold it into the "silent notifications" bucket and hide it from the
-        // shade. Channel id carries a version suffix because channel settings are
-        // immutable once created.
+        // NOTE: the countdown notification deliberately reuses BLOCKER_CHANNEL_ID instead of
+        // this one. A dedicated channel looks cleaner, but on MIUI/HyperOS a freshly created
+        // channel starts out disabled, and a disabled channel silently swallows every
+        // notification (no error, no icon - it simply never appears). The blocker channel is
+        // created during onboarding, has to be enabled for blocking to work at all, and is
+        // already configured without sound, so it is the reliable vehicle here.
         notificationManager.createNotificationChannel(
             NotificationChannel(
                 ROUTINE_BUDGET_CHANNEL_ID,
@@ -162,7 +164,7 @@ object NotificationHelper {
         // Round up: while there is still time left, never show "0 minutes".
         val minutes = ((remainingMs + 59_999L) / 60_000L).toInt()
 
-        return NotificationCompat.Builder(context, ROUTINE_BUDGET_CHANNEL_ID)
+        return NotificationCompat.Builder(context, BLOCKER_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle(appName)
             .setContentText("本段还能玩 $minutes 分钟")
