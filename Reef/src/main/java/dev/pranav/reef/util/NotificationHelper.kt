@@ -17,7 +17,7 @@ import dev.pranav.reef.services.routines.RoutineSessionManager
 object NotificationHelper {
     const val ROUTINE_STATUS_NOTIFICATION_ID = 5001
     const val ROUTINE_BUDGET_NOTIFICATION_ID = 5002
-    const val ROUTINE_BUDGET_CHANNEL_ID = "reef_routine_budget"
+    const val ROUTINE_BUDGET_CHANNEL_ID = "reef_routine_budget_v2"
     private const val REMINDER_NOTIFICATION_ID = 200
 
     const val BLOCKER_GROUP_KEY = "dev.pranav.reef.BLOCKER_GROUP"
@@ -69,13 +69,15 @@ object NotificationHelper {
                 setBypassDnd(true)
             }
         )
-        // Silent, but with a status bar icon: shows the remaining routine budget of the
-        // app currently in the foreground.
+        // Silent (no sound, no heads-up), but at DEFAULT importance so that MIUI/HyperOS
+        // does not fold it into the "silent notifications" bucket and hide it from the
+        // shade. Channel id carries a version suffix because channel settings are
+        // immutable once created.
         notificationManager.createNotificationChannel(
             NotificationChannel(
                 ROUTINE_BUDGET_CHANNEL_ID,
                 "剩余可用时间",
-                NotificationManager.IMPORTANCE_LOW
+                NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
                 description = "专注时间段内显示当前应用的剩余可用时间"
                 setShowBadge(false)
@@ -160,7 +162,7 @@ object NotificationHelper {
             .setOnlyAlertOnce(true)
             .setSilent(true)
             .setShowWhen(false)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
 
         NotificationManagerCompat.from(context)
