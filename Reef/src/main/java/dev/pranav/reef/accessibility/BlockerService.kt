@@ -64,9 +64,6 @@ class BlockerService : AccessibilityService() {
     /** Cached answers to "is this a system package". */
     private val systemAppCache = mutableMapOf<String, Boolean>()
 
-    /** Whether the accessibility service is currently running as a foreground service. */
-    private var budgetInForeground = false
-
     private var activeBrowserPackage: String? = null
     private var activeBrowserConfig: BrowserConfig? = null
     private val browserPackages = mutableSetOf<String>()
@@ -405,13 +402,6 @@ class BlockerService : AccessibilityService() {
     private fun stopBudgetTicker() {
         budgetPackage = null
         handler.removeCallbacks(budgetTickRunnable)
-        if (budgetInForeground) {
-            budgetInForeground = false
-            try {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } catch (_: Exception) {
-            }
-        }
         NotificationHelper.cancelBudgetNotification(this)
     }
 
@@ -425,27 +415,14 @@ class BlockerService : AccessibilityService() {
             }
             val notification = NotificationHelper.buildBudgetNotification(this, pkg, remainingMs)
                 ?: return
-            if (!promoteBudgetToForeground(notification)) {
-                NotificationManagerCompat.from(this)
-                    .notify(NotificationHelper.ROUTINE_BUDGET_NOTIFICATION_ID, notification)
-            }
+            // Plain notification, exactly like the blocker alerts that this device renders
+            // reliably. Deliberately NOT a foreground-service notification: binding it to the
+            // accessibility service made the system tear the notification down together with
+            // the service, which is what the user saw as "it flashes and disappears".
+            NotificationManagerCompat.from(this)
+                .notify(NotificationHelper.ROUTINE_BUDGET_NOTIFICATION_ID, notification)
         } catch (e: Exception) {
             Log.w("BlockerService", "Unable to update the budget notification", e)
-        }
-    }
-
-    /**
-     * Runs this accessibility service as a foreground service so the countdown notification
-     * is registered as "ongoing" by the system.
-     */
-    private fun promoteBudgetToForeground(notification: android.app.Notification): Boolean {
-        return try {
-            startForeground(NotificationHelper.ROUTINE_BUDGET_NOTIFICATION_ID, notification)
-            budgetInForeground = true
-            true
-        } catch (e: Exception) {
-            Log.w("BlockerService", "startForeground failed, using a normal notification", e)
-            false
         }
     }
 
@@ -709,13 +686,6 @@ class BlockerService : AccessibilityService() {
         handler.removeCallbacks(websiteLimitPollRunnable)
         handler.removeCallbacks(routinePollRunnable)
         handler.removeCallbacks(budgetTickRunnable)
-        if (budgetInForeground) {
-            budgetInForeground = false
-            try {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } catch (_: Exception) {
-            }
-        }
         budgetPackage = null
         NotificationHelper.cancelBudgetNotification(this)
         foregroundPackage = null
