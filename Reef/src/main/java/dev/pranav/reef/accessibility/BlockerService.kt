@@ -58,6 +58,9 @@ class BlockerService : AccessibilityService() {
     /** Resolved launcher package, used to tell "went home" apart from a transient system window. */
     private var homePackage: String? = null
 
+    /** Cached answers to "does this package have a launcher icon", i.e. is it a real app. */
+    private val launcherIntentCache = mutableMapOf<String, Boolean>()
+
     private var activeBrowserPackage: String? = null
     private var activeBrowserConfig: BrowserConfig? = null
     private val browserPackages = mutableSetOf<String>()
@@ -211,13 +214,19 @@ class BlockerService : AccessibilityService() {
 
             // Keep a silent, ongoing "X minutes left" notification in sync with whatever
             // app is actually in the foreground. Window-state events are noisy: launching
-            // an app also reports system UI / the launcher for a moment, and treating those
-            // as "the user switched apps" made the notification flash and vanish instantly.
+            // an app, pulling down the notification shade, or a system dialog all report
+            // some other window for a moment. Treating those as "the user switched apps"
+            // made the notification flash and vanish instantly, so only windows that
+            // belong to a real, launchable app are allowed to change the countdown.
             when {
+                // Opening Reef itself means the user left the tracked app.
                 pkg == packageName -> stopBudgetTicker()
-                pkg == homePackage -> stopBudgetTicker()
-                pkg in TRANSIENT_PACKAGES -> Unit
-                else -> startBudgetTicker(pkg)
+                // Returning home, or any system window (notification shade, installers,
+                // dialogs, IME) keeps the current countdown alive: cancelling here is what
+                // made the notification vanish the moment it was pulled down.
+                pkg == homePackage || pkg in TRANSIENT_PACKAGES -> Unit
+                hasLauncherIntent(pkg) -> startBudgetTicker(pkg)
+                else -> Unit
             }
 
             if (!browserPackages.contains(pkg)) {
@@ -322,6 +331,20 @@ class BlockerService : AccessibilityService() {
     } catch (_: Exception) {
         null
     }
+
+    /**
+     * True when [pkg] is a normal, launchable application (something with an icon in the
+     * app drawer). System UI variants, notification shades, installers, input methods and
+     * other floating windows do not qualify, so they never interrupt an active countdown.
+     */
+    private fun hasLauncherIntent(pkg: String): Boolean =
+        launcherIntentCache.getOrPut(pkg) {
+            try {
+                packageManager.getLaunchIntentForPackage(pkg) != null
+            } catch (_: Exception) {
+                false
+            }
+        }
 
     private fun startBudgetTicker(pkg: String) {
         if (budgetPackage == pkg) {
