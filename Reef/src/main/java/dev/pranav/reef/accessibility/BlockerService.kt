@@ -67,6 +67,9 @@ class BlockerService : AccessibilityService() {
     /** Whether the accessibility service is currently running as a foreground service. */
     private var budgetInForeground = false
 
+    /** Last package reported to the debug notification, to avoid spamming it. */
+    private var lastDebugPkg: String? = null
+
     private var activeBrowserPackage: String? = null
     private var activeBrowserConfig: BrowserConfig? = null
     private val browserPackages = mutableSetOf<String>()
@@ -368,6 +371,11 @@ class BlockerService : AccessibilityService() {
      *    notification flap between "cancelled" and "posted".
      */
     private fun onForegroundApp(pkg: String) {
+        if (pkg != lastDebugPkg) {
+            lastDebugPkg = pkg
+            val limited = RoutineSessionManager.getLimitMs(pkg) != null
+            debugNotify("前台: $pkg 限时=$limited")
+        }
         if (pkg == packageName) {
             stopBudgetTicker()
             return
@@ -423,16 +431,50 @@ class BlockerService : AccessibilityService() {
 
     private fun refreshBudgetNotification() {
         val pkg = budgetPackage ?: return
-        val remainingMs = RoutineSessionManager.getRemainingMs(this, pkg)
-        if (remainingMs == null || remainingMs <= 0L) {
-            stopBudgetTicker()
-            return
+        try {
+            val remainingMs = RoutineSessionManager.getRemainingMs(this, pkg)
+            if (remainingMs == null) {
+                debugNotify("无额度: $pkg")
+                stopBudgetTicker()
+                return
+            }
+            if (remainingMs <= 0L) {
+                debugNotify("额度用完: $pkg")
+                stopBudgetTicker()
+                return
+            }
+            val notification = NotificationHelper.buildBudgetNotification(this, pkg, remainingMs)
+            if (notification == null) {
+                debugNotify("构造失败(通知权限?)")
+                return
+            }
+            val ok = promoteBudgetToForeground(notification)
+            debugNotify("$pkg 剩${remainingMs / 60000}分 前台=$ok")
+            if (!ok) {
+                NotificationManagerCompat.from(this)
+                    .notify(NotificationHelper.ROUTINE_BUDGET_NOTIFICATION_ID, notification)
+            }
+        } catch (t: Throwable) {
+            debugNotify("异常: ${t.javaClass.simpleName} ${t.message}")
         }
-        val notification =
-            NotificationHelper.buildBudgetNotification(this, pkg, remainingMs) ?: return
-        if (!promoteBudgetToForeground(notification)) {
-            NotificationManagerCompat.from(this)
-                .notify(NotificationHelper.ROUTINE_BUDGET_NOTIFICATION_ID, notification)
+    }
+
+    /**
+     * Temporary diagnostics: reports what the budget code is doing through the blocker channel,
+     * which is known to render reliably on devices where ordinary notifications disappear.
+     */
+    private fun debugNotify(message: String) {
+        try {
+            val notification = NotificationCompat.Builder(this, BLOCKER_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setContentTitle("调试")
+                .setContentText(message)
+                .setOnlyAlertOnce(true)
+                .setSilent(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+            NotificationManagerCompat.from(this).notify(9999, notification)
+        } catch (_: Exception) {
         }
     }
 
