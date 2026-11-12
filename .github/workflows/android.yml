@@ -22,7 +22,7 @@ jobs:
       - name: Give permission to executable
         run: chmod +x gradlew
 
-      # FIX: the action's default package list is "tools platform-tools", but Google
+      # FIX 1: the action's default package list is "tools platform-tools", but Google
       # removed the "tools" package from the SDK repository, which makes sdkmanager
       # fail with "Failed to find package 'tools'". Only ask for platform-tools.
       - name: Setup Android SDK
@@ -30,10 +30,19 @@ jobs:
         with:
           packages: 'platform-tools'
 
+      # FIX 2: API 37 is new; it may live in a preview channel or not be published at
+      # all. Never let a missing package abort the job - print what exists, try the
+      # stable channel first and then the canary channel, and let Gradle report the
+      # real problem if the platform is genuinely unavailable.
       - name: Install Android SDK packages
         run: |
-          sdkmanager --install "platform-tools" "platforms;android-37" "build-tools;37.0.0"
+          set -x
+          sdkmanager --list | grep -E "platforms;android-3[5-9]" || true
+          sdkmanager --install "platform-tools" || true
+          sdkmanager --install "build-tools;37.0.0" || true
+          sdkmanager --install "platforms;android-37" || sdkmanager --channel=3 --install "platforms;android-37" || true
           yes | sdkmanager --licenses || true
+          ls "$ANDROID_HOME/platforms" || true
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4.4.1
@@ -52,5 +61,3 @@ jobs:
         with:
           name: app-release
           path: Reef/build/outputs/apk/release
-
-    
