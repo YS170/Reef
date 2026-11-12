@@ -17,6 +17,7 @@ import dev.pranav.reef.services.routines.RoutineSessionManager
 object NotificationHelper {
     const val ROUTINE_STATUS_NOTIFICATION_ID = 5001
     const val ROUTINE_BUDGET_NOTIFICATION_ID = 5002
+    const val ROUTINE_BUDGET_CHANNEL_ID = "reef_routine_budget"
     private const val REMINDER_NOTIFICATION_ID = 200
 
     const val BLOCKER_GROUP_KEY = "dev.pranav.reef.BLOCKER_GROUP"
