@@ -55,6 +55,9 @@ class BlockerService : AccessibilityService() {
     /** Package whose remaining routine budget is currently shown in the status bar. */
     private var budgetPackage: String? = null
 
+    /** Resolved launcher package, used to tell "went home" apart from a transient system window. */
+    private var homePackage: String? = null
+
     private var activeBrowserPackage: String? = null
     private var activeBrowserConfig: BrowserConfig? = null
     private val browserPackages = mutableSetOf<String>()
@@ -160,6 +163,7 @@ class BlockerService : AccessibilityService() {
         WebsiteUsageTracker.init(this)
         WebsiteLimits.init(this)
         refreshBrowserPackages()
+        homePackage = resolveHomePackage()
 
         if (!isPrefsInitialized) {
             val deviceContext = createDeviceProtectedStorageContext()
@@ -206,11 +210,14 @@ class BlockerService : AccessibilityService() {
             }
 
             // Keep a silent, ongoing "X minutes left" notification in sync with whatever
-            // app is actually in the foreground.
-            if (pkg == packageName) {
-                stopBudgetTicker()
-            } else {
-                startBudgetTicker(pkg)
+            // app is actually in the foreground. Window-state events are noisy: launching
+            // an app also reports system UI / the launcher for a moment, and treating those
+            // as "the user switched apps" made the notification flash and vanish instantly.
+            when {
+                pkg == packageName -> stopBudgetTicker()
+                pkg == homePackage -> stopBudgetTicker()
+                pkg in TRANSIENT_PACKAGES -> Unit
+                else -> startBudgetTicker(pkg)
             }
 
             if (!browserPackages.contains(pkg)) {
@@ -304,6 +311,16 @@ class BlockerService : AccessibilityService() {
             lastAppCheckAtMs = now
         }
         return !isDuplicate
+    }
+
+    @Suppress("DEPRECATION")
+    private fun resolveHomePackage(): String? = try {
+        packageManager.resolveActivity(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),
+            PackageManager.MATCH_DEFAULT_ONLY
+        )?.activityInfo?.packageName
+    } catch (_: Exception) {
+        null
     }
 
     private fun startBudgetTicker(pkg: String) {
@@ -606,6 +623,21 @@ class BlockerService : AccessibilityService() {
         private const val ROUTINE_POLL_INTERVAL_MS = 30_000L
         private const val APP_CHECK_DEBOUNCE_MS = 500L
         private const val BUDGET_TICK_INTERVAL_MS = 60_000L
+
+        /**
+         * Windows that briefly steal the foreground while another app is being opened or
+         * while the notification shade is pulled down. They must never be treated as
+         * "the user switched to another app", otherwise the countdown notification is
+         * cancelled the instant it appears.
+         */
+        private val TRANSIENT_PACKAGES = setOf(
+            "com.android.systemui",
+            "com.android.packageinstaller",
+            "com.google.android.packageinstaller",
+            "com.android.permissioncontroller",
+            "com.google.android.permissioncontroller",
+            "android"
+        )
 
         @Volatile
         var isBound: Boolean = false
