@@ -139,9 +139,6 @@ class BlockerService : AccessibilityService() {
         }
     }
 
-    /** Deferred "the user really left the app" decision; see onForegroundApp(). */
-    private val pendingBudgetStop = Runnable { stopBudgetTicker() }
-
     private data class BrowserConfig(
         val urlBarId: String,
         val suggestionBoxId: String,
@@ -361,11 +358,10 @@ class BlockerService : AccessibilityService() {
     /**
      * Decides what the countdown notification should do when [pkg] takes the foreground.
      *
-     * Two ideas keep it stable on MIUI/HyperOS:
-     *  - windows that are not real apps (shade, home, installers, IME) are ignored entirely;
-     *  - leaving the app is only applied after the new app has stayed in front for
-     *    [BUDGET_STOP_DELAY_MS], so a burst of alternating window events cannot make the
-     *    notification flap between "cancelled" and "posted".
+     * Design rule: once the countdown is on screen it is NOT removed by app switching.
+     * Window events are far too noisy on MIUI/HyperOS (shade, launcher, screen recorders,
+     * floating windows), and every "cancel on switch" variant ended up killing the
+     * notification seconds after it appeared.
      */
     private fun onForegroundApp(pkg: String) {
         if (pkg == packageName) {
@@ -379,7 +375,6 @@ class BlockerService : AccessibilityService() {
         // An app that actually has a routine budget is always followed, even if it is a
         // pre-installed one (a system browser, for example).
         if (RoutineSessionManager.getLimitMs(pkg) != null) {
-            handler.removeCallbacks(pendingBudgetStop)
             startBudgetTicker(pkg)
             return
         }
@@ -390,11 +385,10 @@ class BlockerService : AccessibilityService() {
         if (isSystemApp(pkg)) return
         if (!hasLauncherIntent(pkg)) return
 
-        // The user moved to another ordinary app. Give it a moment first: transient windows
-        // can report a different package for a fraction of a second, and cancelling
-        // immediately is what produced the flashing.
-        handler.removeCallbacks(pendingBudgetStop)
-        handler.postDelayed(pendingBudgetStop, BUDGET_STOP_DELAY_MS)
+        // A completely different, unrestricted app. Deliberately does nothing: the countdown
+        // is only ever cleared when the budget is used up, the screen is turned off, or Reef
+        // itself is opened. Any "cancel after switching" rule kept firing on screen recorders,
+        // floating windows and other helper apps, which made the notification flash and die.
     }
 
     private fun startBudgetTicker(pkg: String) {
@@ -424,8 +418,8 @@ class BlockerService : AccessibilityService() {
     private fun refreshBudgetNotification() {
         val pkg = budgetPackage ?: return
         try {
-            val remainingMs = RoutineSessionManager.getRemainingMs(this, pkg)
-            if (remainingMs == null || remainingMs <= 0L) {
+            val remainingMs = RoutineSessionManager.getRemainingMs(this, pkg) ?: return
+            if (remainingMs <= 0L) {
                 stopBudgetTicker()
                 return
             }
@@ -715,7 +709,6 @@ class BlockerService : AccessibilityService() {
         handler.removeCallbacks(websiteLimitPollRunnable)
         handler.removeCallbacks(routinePollRunnable)
         handler.removeCallbacks(budgetTickRunnable)
-        handler.removeCallbacks(pendingBudgetStop)
         if (budgetInForeground) {
             budgetInForeground = false
             try {
@@ -736,7 +729,6 @@ class BlockerService : AccessibilityService() {
         private const val ROUTINE_POLL_INTERVAL_MS = 30_000L
         private const val APP_CHECK_DEBOUNCE_MS = 500L
         private const val BUDGET_TICK_INTERVAL_MS = 60_000L
-        private const val BUDGET_STOP_DELAY_MS = 3_000L
 
         /**
          * Windows that briefly steal the foreground while another app is being opened or
