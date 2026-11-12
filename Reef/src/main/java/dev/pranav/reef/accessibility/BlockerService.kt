@@ -61,6 +61,9 @@ class BlockerService : AccessibilityService() {
     /** Cached answers to "does this package have a launcher icon", i.e. is it a real app. */
     private val launcherIntentCache = mutableMapOf<String, Boolean>()
 
+    /** Cached answers to "is this a system package". */
+    private val systemAppCache = mutableMapOf<String, Boolean>()
+
     private var activeBrowserPackage: String? = null
     private var activeBrowserConfig: BrowserConfig? = null
     private val browserPackages = mutableSetOf<String>()
@@ -132,6 +135,9 @@ class BlockerService : AccessibilityService() {
             handler.postDelayed(this, BUDGET_TICK_INTERVAL_MS)
         }
     }
+
+    /** Deferred "the user really left the app" decision; see onForegroundApp(). */
+    private val pendingBudgetStop = Runnable { stopBudgetTicker() }
 
     private data class BrowserConfig(
         val urlBarId: String,
@@ -213,21 +219,13 @@ class BlockerService : AccessibilityService() {
             }
 
             // Keep a silent, ongoing "X minutes left" notification in sync with whatever
-            // app is actually in the foreground. Window-state events are noisy: launching
-            // an app, pulling down the notification shade, or a system dialog all report
-            // some other window for a moment. Treating those as "the user switched apps"
-            // made the notification flash and vanish instantly, so only windows that
-            // belong to a real, launchable app are allowed to change the countdown.
-            when {
-                // Opening Reef itself means the user left the tracked app.
-                pkg == packageName -> stopBudgetTicker()
-                // Returning home, or any system window (notification shade, installers,
-                // dialogs, IME) keeps the current countdown alive: cancelling here is what
-                // made the notification vanish the moment it was pulled down.
-                pkg == homePackage || pkg in TRANSIENT_PACKAGES -> Unit
-                hasLauncherIntent(pkg) -> startBudgetTicker(pkg)
-                else -> Unit
-            }
+            // app is actually in the foreground. Window-state events are extremely noisy:
+            // opening an app, pulling down the shade, or a system dialog all report some
+            // other window for a moment, and on MIUI/HyperOS the app and its system
+            // overlays can alternate several times per second. Reacting to every one of
+            // those made the notification flash (cancel + recreate in a loop), so the
+            // "you left the app" decision is deferred instead of taken immediately.
+            onForegroundApp(pkg)
 
             if (!browserPackages.contains(pkg)) {
                 WebsiteUsageTracker.stopTracking()
@@ -345,6 +343,56 @@ class BlockerService : AccessibilityService() {
                 false
             }
         }
+
+    /** True for pre-installed / system packages (shade, launcher, Settings, installers...). */
+    private fun isSystemApp(pkg: String): Boolean =
+        systemAppCache.getOrPut(pkg) {
+            try {
+                val info = packageManager.getApplicationInfo(pkg, 0)
+                (info.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+    /**
+     * Decides what the countdown notification should do when [pkg] takes the foreground.
+     *
+     * Two ideas keep it stable on MIUI/HyperOS:
+     *  - windows that are not real apps (shade, home, installers, IME) are ignored entirely;
+     *  - leaving the app is only applied after the new app has stayed in front for
+     *    [BUDGET_STOP_DELAY_MS], so a burst of alternating window events cannot make the
+     *    notification flap between "cancelled" and "posted".
+     */
+    private fun onForegroundApp(pkg: String) {
+        if (pkg == packageName) {
+            stopBudgetTicker()
+            return
+        }
+        // Going home never cancels: on MIUI the shade and the launcher can report the same
+        // package, and cancelling here is what made the notification vanish on pull-down.
+        if (pkg == homePackage) return
+
+        // An app that actually has a routine budget is always followed, even if it is a
+        // pre-installed one (a system browser, for example).
+        if (RoutineSessionManager.getLimitMs(pkg) != null) {
+            handler.removeCallbacks(pendingBudgetStop)
+            startBudgetTicker(pkg)
+            return
+        }
+
+        // Everything that is not a normal user app (shade, Settings, installers, IME,
+        // system overlays) is ignored: it is not a real app switch.
+        if (pkg in TRANSIENT_PACKAGES) return
+        if (isSystemApp(pkg)) return
+        if (!hasLauncherIntent(pkg)) return
+
+        // The user moved to another ordinary app. Give it a moment first: transient windows
+        // can report a different package for a fraction of a second, and cancelling
+        // immediately is what produced the flashing.
+        handler.removeCallbacks(pendingBudgetStop)
+        handler.postDelayed(pendingBudgetStop, BUDGET_STOP_DELAY_MS)
+    }
 
     private fun startBudgetTicker(pkg: String) {
         if (budgetPackage == pkg) {
@@ -633,6 +681,7 @@ class BlockerService : AccessibilityService() {
         handler.removeCallbacks(websiteLimitPollRunnable)
         handler.removeCallbacks(routinePollRunnable)
         handler.removeCallbacks(budgetTickRunnable)
+        handler.removeCallbacks(pendingBudgetStop)
         budgetPackage = null
         NotificationHelper.cancelBudgetNotification(this)
         foregroundPackage = null
@@ -646,6 +695,7 @@ class BlockerService : AccessibilityService() {
         private const val ROUTINE_POLL_INTERVAL_MS = 30_000L
         private const val APP_CHECK_DEBOUNCE_MS = 500L
         private const val BUDGET_TICK_INTERVAL_MS = 60_000L
+        private const val BUDGET_STOP_DELAY_MS = 3_000L
 
         /**
          * Windows that briefly steal the foreground while another app is being opened or
