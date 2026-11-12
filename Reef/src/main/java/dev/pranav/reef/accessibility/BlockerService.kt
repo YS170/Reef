@@ -1,727 +1,366 @@
-package dev.pranav.reef.accessibility
+package dev.pranav.reef.services.routines
 
-import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.AccessibilityServiceInfo
-import android.annotation.SuppressLint
-import android.app.KeyguardManager
-import android.content.BroadcastReceiver
+import android.app.usage.UsageStatsManager
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
-import android.content.pm.PackageManager
-import android.net.Uri
-import android.os.Build
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.os.SystemClock
 import android.util.Log
-import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
-import dev.pranav.reef.MindfulLaunchActivity
-import dev.pranav.reef.R
-import dev.pranav.reef.services.routines.RoutineSessionManager
-import dev.pranav.reef.util.BLOCKER_CHANNEL_ID
-import dev.pranav.reef.util.FocusStats
-import dev.pranav.reef.util.MindfulLaunchManager
-import dev.pranav.reef.util.MindfulLaunchTargetEvaluator
+import androidx.core.content.edit
+import dev.pranav.reef.data.Routine
+import dev.pranav.reef.data.RoutineSchedule
 import dev.pranav.reef.util.NotificationHelper
-import dev.pranav.reef.util.NotificationHelper.BLOCKER_GROUP_KEY
-import dev.pranav.reef.util.NotificationHelper.createNotificationChannel
-import dev.pranav.reef.util.NotificationHelper.syncRoutineNotification
-import dev.pranav.reef.util.WebsiteBlocklist
-import dev.pranav.reef.util.WebsiteLimits
-import dev.pranav.reef.util.Whitelist
-import dev.pranav.reef.util.isPrefsInitialized
+import dev.pranav.reef.util.ScreenUsageHelper
 import dev.pranav.reef.util.prefs
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
+import org.json.JSONObject
+import java.time.LocalDateTime
 
-@SuppressLint("AccessibilityPolicy")
-class BlockerService : AccessibilityService() {
+object RoutineSessionManager {
+    private const val TAG = "RoutineSessionManager"
+    private const val ACTIVE_SESSIONS_KEY = "active_routine_sessions"
 
-    private val handler = Handler(Looper.getMainLooper())
-    private var keyguardManager: KeyguardManager? = null
-    private val notificationManager by lazy { NotificationManagerCompat.from(this) }
-    private var screenReceiverRegistered = false
-    private var lastCheckedPackage: String? = null
-    private var lastAppCheckAtMs = 0L
-    private var foregroundPackage: String? = null
-    private var enforcedForegroundPackage: String? = null
-
-    /** Package whose remaining routine budget is currently shown in the status bar. */
-    private var budgetPackage: String? = null
-
-    /** Resolved launcher package, used to tell "went home" apart from a transient system window. */
-    private var homePackage: String? = null
-
-    /** Cached answers to "does this package have a launcher icon", i.e. is it a real app. */
-    private val launcherIntentCache = mutableMapOf<String, Boolean>()
-
-    /** Cached answers to "is this a system package". */
-    private val systemAppCache = mutableMapOf<String, Boolean>()
-
-    private var activeBrowserPackage: String? = null
-    private var activeBrowserConfig: BrowserConfig? = null
-    private val browserPackages = mutableSetOf<String>()
-
-    private val screenReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                Intent.ACTION_SCREEN_OFF -> {
-                    WebsiteUsageTracker.stopTracking()
-                    stopBudgetTicker()
-                }
-
-                Intent.ACTION_USER_PRESENT, Intent.ACTION_SCREEN_ON -> {
-                    // Start tracking again if we are already in a browser with a domain
-                    // but we will let onAccessibilityEvent handle the current domain state
-                }
-            }
-        }
-    }
-
-    private val websiteLimitPollRunnable = object : Runnable {
-        override fun run() {
-            try {
-                val currentDomain = WebsiteUsageTracker.getCurrentTrackingDomain()
-                if (currentDomain != null && WebsiteLimits.hasLimit(
-                        currentDomain
-                    )
-                ) {
-                    val limit = WebsiteLimits.getLimit(currentDomain)
-                    val usage = WebsiteUsageTracker.getDailyUsage(currentDomain)
-                    Log.d("BlockerService", "limit=$limit, usage=$usage for $currentDomain")
-                    if (usage >= limit) {
-                        WebsiteUsageTracker.stopTracking()
-                        activeBrowserConfig?.let { config ->
-                            performRedirect(config)
-                            showBlockedNotification(
-                                currentDomain,
-                                UsageTracker.BlockReason.DAILY_LIMIT,
-                                isWebsite = true
-                            )
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e("BlockerService", "Website limit poll error", e)
-            }
-            handler.postDelayed(this, 5000L) // Poll every 5 seconds
-        }
-    }
-
-    private val routinePollRunnable = object : Runnable {
-        override fun run() {
-            try {
-                RoutineSessionManager.evaluateAndSync(this@BlockerService)
-                syncRoutineNotification(this@BlockerService)
-                // A routine window may have just ended (or been disabled): drop the
-                // "time left" notification if it no longer applies.
-                refreshBudgetNotification()
-            } catch (e: Exception) {
-                Log.e("BlockerService", "Routine poll error", e)
-            }
-            handler.postDelayed(this, ROUTINE_POLL_INTERVAL_MS)
-        }
-    }
-
-    private val budgetTickRunnable = object : Runnable {
-        override fun run() {
-            refreshBudgetNotification()
-            handler.postDelayed(this, BUDGET_TICK_INTERVAL_MS)
-        }
-    }
-
-    /** Deferred "the user really left the app" decision; see onForegroundApp(). */
-    private val pendingBudgetStop = Runnable { stopBudgetTicker() }
-
-    private data class BrowserConfig(
-        val urlBarId: String,
-        val suggestionBoxId: String,
-        val isSuggestionBoxEqualToGo: Boolean = false,
-        val suggestionBoxChildIndex: Int = 0
+    data class SharedGroupSession(
+        val groupId: String,
+        val packageNames: List<String>,
+        val sharedLimitMs: Long
     )
 
-    private val commonResourceConfigs = listOf(
-        Triple("url_bar", "omnibox_suggestions_dropdown", false), // Chrome, Brave, Edge, Vivaldi
-        Triple("mozac_browser_toolbar_url_view", "sfcnt", false), // Firefox
-        Triple("url_field", "right_state_button", true), // Opera
-        Triple("location_bar_edit_text", "location_bar_edit_text", false), // Samsung
-        Triple("omnibarTextInput", "omnibarTextInput", false) // DuckDuckGo
+    data class ActiveSession(
+        val routineId: String,
+        val startTime: Long,
+        val endTime: Long,
+        val isManual: Boolean,
+        val limits: Map<String, Long>,
+        val sharedGroups: List<SharedGroupSession> = emptyList()
     )
 
-    private val redirectUrl = "about:blank"
+    @Volatile
+    private var cachedSessions: List<ActiveSession>? = null
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY
-    }
+    fun evaluateAndSync(context: Context) {
+        val routines = dev.pranav.reef.routine.Routines.getAll()
+        val now = System.currentTimeMillis()
+        var changed = false
 
-    override fun onServiceConnected() {
-        super.onServiceConnected()
-        isBound = true
-        lastEventEpochMs = System.currentTimeMillis()
-        _connectionState.value = false
-        configureService()
-        createNotificationChannel()
-        keyguardManager = getSystemService(KEYGUARD_SERVICE) as KeyguardManager
-
-        WebsiteUsageTracker.init(this)
-        WebsiteLimits.init(this)
-        refreshBrowserPackages()
-        homePackage = resolveHomePackage()
-
-        if (!isPrefsInitialized) {
-            val deviceContext = createDeviceProtectedStorageContext()
-            prefs = deviceContext.getSharedPreferences("prefs", MODE_PRIVATE)
-        }
-
-        val filter = IntentFilter().apply {
-            addAction(Intent.ACTION_SCREEN_OFF)
-            addAction(Intent.ACTION_SCREEN_ON)
-            addAction(Intent.ACTION_USER_PRESENT)
-        }
-        if (!screenReceiverRegistered) {
-            registerReceiver(screenReceiver, filter)
-            screenReceiverRegistered = true
-        }
-
-        handler.removeCallbacks(routinePollRunnable)
-        handler.removeCallbacks(websiteLimitPollRunnable)
-        handler.post(routinePollRunnable)
-        handler.post(websiteLimitPollRunnable)
-        _connectionState.value = true
-    }
-
-    private fun configureService() {
-        serviceInfo = AccessibilityServiceInfo().apply {
-            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
-                    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-            feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
-            notificationTimeout = 100
-        }
-    }
-
-    override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        lastEventEpochMs = System.currentTimeMillis()
-        if (keyguardManager?.isKeyguardLocked == true) return
-
-        val pkg = event.packageName?.toString() ?: return
-
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            if (foregroundPackage != pkg) {
-                foregroundPackage = pkg
-                enforcedForegroundPackage = null
+        // 1. Expire sessions whose endTime has passed
+        val currentSessions = getActiveSessions()
+        val expired = currentSessions.filter { it.endTime > 0 && now >= it.endTime }
+        for (session in expired) {
+            Log.d(TAG, "Expiring session: ${session.routineId}")
+            stopSessionInternal(context, session.routineId)
+            routines.find { it.id == session.routineId }?.let { routine ->
+                if (routine.isEnabled) RoutineAlarmScheduler.scheduleNextStart(context, routine)
             }
+            changed = true
+        }
 
-            // Keep a silent, ongoing "X minutes left" notification in sync with whatever
-            // app is actually in the foreground. Window-state events are extremely noisy:
-            // opening an app, pulling down the shade, or a system dialog all report some
-            // other window for a moment, and on MIUI/HyperOS the app and its system
-            // overlays can alternate several times per second. Reacting to every one of
-            // those made the notification flash (cancel + recreate in a loop), so the
-            // "you left the app" decision is deferred instead of taken immediately.
-            onForegroundApp(pkg)
-
-            if (!browserPackages.contains(pkg)) {
-                WebsiteUsageTracker.stopTracking()
-                activeBrowserPackage = null
-                activeBrowserConfig = null
-            } else {
-                activeBrowserPackage = pkg
+        // 2. Remove sessions for routines that were deleted or disabled
+        val enabledIds = routines.filter { it.isEnabled }.map { it.id }.toSet()
+        val allIds = routines.map { it.id }.toSet()
+        for (session in getActiveSessions()) {
+            if (session.routineId !in allIds) {
+                Log.d(TAG, "Removing orphaned session: ${session.routineId}")
+                stopSessionInternal(context, session.routineId)
+                changed = true
+            } else if (session.routineId !in enabledIds) {
+                Log.d(TAG, "Removing disabled routine session: ${session.routineId}")
+                stopSessionInternal(context, session.routineId)
+                changed = true
             }
         }
 
-        if (pkg == packageName) return
-
-        // Content events can arrive after another app has already taken the foreground.
-        // Ignoring those stale events prevents repeatedly forcing Home for the same launch.
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&
-            foregroundPackage != null &&
-            pkg != foregroundPackage
-        ) {
-            return
+        // 3. Activate routines that should be active now but have no session
+        val activeIds = getActiveSessions().map { it.routineId }.toSet()
+        val toActivate =
+            RoutineEvaluator.findRoutinesToActivate(routines, activeIds, LocalDateTime.now())
+        for (info in toActivate) {
+            Log.d(TAG, "Auto-activating routine: ${info.routine.name}")
+            startSessionInternal(context, info.routine, info.sessionStartMs, info.sessionEndMs)
+            changed = true
         }
 
-        if (activeBrowserPackage == pkg) {
-            val root = rootInActiveWindow ?: event.source ?: return
-            val config = findBrowserConfig(root, pkg)
-            if (config != null) {
-                activeBrowserConfig = config
-                val urlBarNode = findUrlBarNode(root, config.urlBarId)
-                if (urlBarNode != null) {
-                    val url = extractUrlFromNode(urlBarNode)
-                    if (url != null) {
-
-                        Log.d("BlockerService", "Found url=$url in node $urlBarNode")
-                        val domain = sanitizeUrl(url)
-
-                        if (WebsiteBlocklist.isBlocked(domain)) {
-                            WebsiteUsageTracker.stopTracking()
-                            performRedirect(config)
-                            showBlockedNotification(
-                                domain,
-                                UsageTracker.BlockReason.DAILY_LIMIT,
-                                isWebsite = true
-                            )
-                            return
-                        }
-
-                        if (WebsiteLimits.hasLimit(domain)) {
-                            WebsiteUsageTracker.startTracking(domain)
-                            val limit = WebsiteLimits.getLimit(domain)
-                            val usage = WebsiteUsageTracker.getDailyUsage(domain)
-                            if (usage >= limit) {
-                                WebsiteUsageTracker.stopTracking()
-                                performRedirect(config)
-                                showBlockedNotification(
-                                    domain,
-                                    UsageTracker.BlockReason.DAILY_LIMIT,
-                                    isWebsite = true
-                                )
-                                return
-                            }
-                        } else {
-                            WebsiteUsageTracker.stopTracking()
-                        }
-                    } else {
-                        WebsiteUsageTracker.stopTracking()
-                    }
-                }
-            }
-        }
-
-        val shouldCheckApp = when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> true
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ->
-                event.contentChangeTypes !=
-                        AccessibilityEvent.CONTENT_CHANGE_TYPE_CONTENT_DESCRIPTION
-
-            else -> false
-        }
-
-        if (shouldCheckApp && shouldHandleAppCheck(pkg)) {
-            handleAppBlockCheck(pkg, event.className?.toString())
+        if (changed) {
+            Log.d(TAG, "Sync complete. Active sessions: ${getActiveSessions().size}")
         }
     }
 
-    private fun shouldHandleAppCheck(pkg: String): Boolean {
-        val now = SystemClock.elapsedRealtime()
-        val isDuplicate =
-            pkg == lastCheckedPackage && now - lastAppCheckAtMs < APP_CHECK_DEBOUNCE_MS
-        if (!isDuplicate) {
-            lastCheckedPackage = pkg
-            lastAppCheckAtMs = now
-        }
-        return !isDuplicate
-    }
-
-    @Suppress("DEPRECATION")
-    private fun resolveHomePackage(): String? = try {
-        packageManager.resolveActivity(
-            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),
-            PackageManager.MATCH_DEFAULT_ONLY
-        )?.activityInfo?.packageName
-    } catch (_: Exception) {
-        null
-    }
-
-    /**
-     * True when [pkg] is a normal, launchable application (something with an icon in the
-     * app drawer). System UI variants, notification shades, installers, input methods and
-     * other floating windows do not qualify, so they never interrupt an active countdown.
-     */
-    private fun hasLauncherIntent(pkg: String): Boolean =
-        launcherIntentCache.getOrPut(pkg) {
-            try {
-                packageManager.getLaunchIntentForPackage(pkg) != null
-            } catch (_: Exception) {
-                false
-            }
-        }
-
-    /** True for pre-installed / system packages (shade, launcher, Settings, installers...). */
-    private fun isSystemApp(pkg: String): Boolean =
-        systemAppCache.getOrPut(pkg) {
-            try {
-                val info = packageManager.getApplicationInfo(pkg, 0)
-                (info.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
-            } catch (_: Exception) {
-                false
-            }
-        }
-
-    /**
-     * Decides what the countdown notification should do when [pkg] takes the foreground.
-     *
-     * Two ideas keep it stable on MIUI/HyperOS:
-     *  - windows that are not real apps (shade, home, installers, IME) are ignored entirely;
-     *  - leaving the app is only applied after the new app has stayed in front for
-     *    [BUDGET_STOP_DELAY_MS], so a burst of alternating window events cannot make the
-     *    notification flap between "cancelled" and "posted".
-     */
-    private fun onForegroundApp(pkg: String) {
-        if (pkg == packageName) {
-            stopBudgetTicker()
-            return
-        }
-        // Going home never cancels: on MIUI the shade and the launcher can report the same
-        // package, and cancelling here is what made the notification vanish on pull-down.
-        if (pkg == homePackage) return
-
-        // An app that actually has a routine budget is always followed, even if it is a
-        // pre-installed one (a system browser, for example).
-        if (RoutineSessionManager.getLimitMs(pkg) != null) {
-            handler.removeCallbacks(pendingBudgetStop)
-            startBudgetTicker(pkg)
-            return
-        }
-
-        // Everything that is not a normal user app (shade, Settings, installers, IME,
-        // system overlays) is ignored: it is not a real app switch.
-        if (pkg in TRANSIENT_PACKAGES) return
-        if (isSystemApp(pkg)) return
-        if (!hasLauncherIntent(pkg)) return
-
-        // The user moved to another ordinary app. Give it a moment first: transient windows
-        // can report a different package for a fraction of a second, and cancelling
-        // immediately is what produced the flashing.
-        handler.removeCallbacks(pendingBudgetStop)
-        handler.postDelayed(pendingBudgetStop, BUDGET_STOP_DELAY_MS)
-    }
-
-    private fun startBudgetTicker(pkg: String) {
-        if (budgetPackage == pkg) {
-            refreshBudgetNotification()
-            return
-        }
-        budgetPackage = pkg
-        handler.removeCallbacks(budgetTickRunnable)
-        refreshBudgetNotification()
-        handler.postDelayed(budgetTickRunnable, BUDGET_TICK_INTERVAL_MS)
-    }
-
-    private fun stopBudgetTicker() {
-        budgetPackage = null
-        handler.removeCallbacks(budgetTickRunnable)
-        NotificationHelper.cancelBudgetNotification(this)
-    }
-
-    private fun refreshBudgetNotification() {
-        val pkg = budgetPackage ?: return
-        val remainingMs = RoutineSessionManager.getRemainingMs(this, pkg)
-        if (remainingMs == null || remainingMs <= 0L) {
-            NotificationHelper.cancelBudgetNotification(this)
+    fun startSession(context: Context, routine: Routine) {
+        val now = System.currentTimeMillis()
+        val endTime = if (routine.schedule.type == RoutineSchedule.ScheduleType.MANUAL) {
+            0L
         } else {
-            NotificationHelper.showBudgetNotification(this, pkg, remainingMs)
+            val window =
+                RoutineTimeCalculator.getSessionWindow(routine.schedule, LocalDateTime.now())
+            window?.endEpochMs ?: (now + RoutineTimeCalculator.getDurationMs(routine.schedule))
         }
+        startSessionInternal(context, routine, now, endTime)
     }
 
-    private fun refreshBrowserPackages() {
-        try {
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://google.com"))
-            val resolveInfos = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                packageManager.queryIntentActivities(
-                    intent,
-                    PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_ALL.toLong())
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                packageManager.queryIntentActivities(intent, PackageManager.MATCH_ALL)
-            }
-            browserPackages.clear()
-            for (info in resolveInfos) {
-                browserPackages.add(info.activityInfo.packageName)
-            }
-            // Always include known ones as fallback
-            browserPackages.addAll(
-                listOf(
-                    "com.android.chrome", "org.mozilla.firefox", "com.opera.browser",
-                    "com.brave.browser", "com.microsoft.emmx", "com.sec.android.app.sbrowser"
-                )
-            )
-        } catch (e: Exception) {
-            Log.e("BlockerService", "Error refreshing browsers", e)
-        }
-    }
-
-    private fun findBrowserConfig(root: AccessibilityNodeInfo, pkg: String): BrowserConfig? {
-        // 1. Try common resource names with current package first
-        for ((urlRes, suggestRes, isGo) in commonResourceConfigs) {
-            val urlId = "$pkg:id/$urlRes"
-            val nodes = root.findAccessibilityNodeInfosByViewId(urlId)
-            if (!nodes.isNullOrEmpty()) {
-                return BrowserConfig(urlId, "$pkg:id/$suggestRes", isGo)
-            }
-        }
-
-        // 2. Try hardcoded full IDs in priority order (Chrome, Mozilla, Opera)
-        val hardcoded = listOf(
-            Triple(
-                "com.android.chrome:id/url_bar",
-                "com.android.chrome:id/omnibox_suggestions_dropdown",
-                false
-            ),
-            Triple(
-                "org.mozilla.firefox:id/mozac_browser_toolbar_url_view",
-                "org.mozilla.firefox:id/sfcnt",
-                false
-            ),
-            Triple(
-                "com.opera.browser:id/url_field",
-                "com.opera.browser:id/right_state_button",
-                true
-            )
-        )
-        for ((urlId, suggestId, isGo) in hardcoded) {
-            val nodes = root.findAccessibilityNodeInfosByViewId(urlId)
-            if (!nodes.isNullOrEmpty()) {
-                return BrowserConfig(urlId, suggestId, isGo)
-            }
-        }
-        return null
-    }
-
-    private fun findUrlBarNode(
-        root: AccessibilityNodeInfo,
-        fullId: String
-    ): AccessibilityNodeInfo? {
-        val nodes = root.findAccessibilityNodeInfosByViewId(fullId)
-        return if (!nodes.isNullOrEmpty()) nodes[0] else null
-    }
-
-    private fun extractUrlFromNode(node: AccessibilityNodeInfo): String? {
-        if (node.isFocused) return null
-        val text = node.text?.toString() ?: return null
-        if (text.isBlank() || !text.contains('.') || text.contains(' ')) return null
-        return text
-    }
-
-    private fun sanitizeUrl(url: String): String {
-        return url.lowercase()
-            .replace("https://", "")
-            .replace("http://", "")
-            .replace("www.", "")
-            .substringBefore('/')
-    }
-
-    private fun performRedirect(config: BrowserConfig) {
-        val initialRoot = rootInActiveWindow ?: return
-        val urlBar = findUrlBarNode(initialRoot, config.urlBarId) ?: return
-        urlBar.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-
-        handler.postDelayed({
-            val editRoot = rootInActiveWindow ?: return@postDelayed
-            val editText = findUrlBarNode(editRoot, config.urlBarId) ?: return@postDelayed
-            val args = Bundle().apply {
-                putCharSequence(
-                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                    redirectUrl
-                )
-            }
-            editText.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-
-            handler.postDelayed({
-                val finalRoot = rootInActiveWindow ?: return@postDelayed
-                performGoAction(finalRoot, config)
-            }, 300)
-        }, 300)
-    }
-
-    private fun performGoAction(root: AccessibilityNodeInfo, config: BrowserConfig) {
-        val nodes = root.findAccessibilityNodeInfosByViewId(config.suggestionBoxId) ?: return
-        val box = nodes.firstOrNull() ?: return
-        if (config.isSuggestionBoxEqualToGo) {
-            box.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+    fun activateIfInWindow(context: Context, routine: Routine) {
+        val window = RoutineTimeCalculator.getSessionWindow(routine.schedule, LocalDateTime.now())
+        if (window != null) {
+            Log.d(TAG, "Routine ${routine.name} is within schedule window, activating immediately")
+            startSessionInternal(context, routine, window.startEpochMs, window.endEpochMs)
         } else {
-            val child = box.getChild(config.suggestionBoxChildIndex)
-            if (child != null) {
-                child.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            }
+            Log.d(
+                TAG,
+                "Routine ${routine.name} is outside schedule window, scheduling alarm for next start"
+            )
+            RoutineAlarmScheduler.scheduleNextStart(context, routine)
         }
     }
 
-    private fun handleAppBlockCheck(pkg: String, className: String? = null) {
-        if (enforcedForegroundPackage == pkg) return
-
-        if (prefs.getBoolean("focus_mode", false)) {
-            if (Whitelist.isWhitelisted(pkg)) return
-
-            FocusStats.recordBlockEvent(pkg, "focus_mode")
-            enforcedForegroundPackage = pkg
-            performGlobalAction(GLOBAL_ACTION_HOME)
-            showFocusModeNotification(pkg)
-            return
-        }
-
-        // Resolve Google Search + Robin activity into the configured Gemini package
-        val targetPkg = MindfulLaunchTargetEvaluator.getTargetPackage(pkg, className)
-
-        if (MindfulLaunchManager.isEnabled() && MindfulLaunchManager.isMindfulApp(targetPkg)) {
-            if (!MindfulLaunchManager.isCurrentlyUnlocked(targetPkg)) {
-                enforcedForegroundPackage = pkg
-                val intent = Intent(this, MindfulLaunchActivity::class.java).apply {
-                    putExtra("target_package", targetPkg)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
-                }
-                startActivity(intent)
-                return
-            }
-        }
-
-        val blockReason = UsageTracker.checkBlockReason(this, targetPkg)
-        if (blockReason != UsageTracker.BlockReason.NONE) {
-            enforcedForegroundPackage = pkg
-            performGlobalAction(GLOBAL_ACTION_HOME)
-            showBlockedNotification(targetPkg, blockReason)
-        }
+    fun stopSession(context: Context, routineId: String) {
+        stopSessionInternal(context, routineId)
     }
 
-    @SuppressLint("MissingPermission")
-    private fun showBlockedNotification(
-        pkgOrUrl: String,
-        reason: UsageTracker.BlockReason,
-        isWebsite: Boolean = false
+    private fun startSessionInternal(
+        context: Context,
+        routine: Routine,
+        startTime: Long,
+        endTime: Long
     ) {
-        if (!notificationManager.areNotificationsEnabled()) return
-        val appName = try {
-            packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkgOrUrl, 0))
-        } catch (_: PackageManager.NameNotFoundException) {
-            pkgOrUrl
-        }
-        val contentText = when (reason) {
-            UsageTracker.BlockReason.ROUTINE_LIMIT -> if (isWebsite) getString(R.string.website_blocked_by_routine) else getString(
-                R.string.blocked_by_routine,
-                appName
-            )
+        val sessions = getActiveSessions().toMutableList()
+        sessions.removeAll { it.routineId == routine.id }
 
-            else -> if (isWebsite) getString(
-                R.string.website_reached_limit,
-                appName
-            ) else getString(R.string.reached_limit, appName)
-        }
+        val limits = buildLimitsMap(routine)
+        val sharedGroups = buildSharedGroups(routine)
 
-        val titleText =
-            if (isWebsite) getString(R.string.website_blocked) else getString(R.string.app_blocked)
-
-        val notification = NotificationCompat.Builder(this, BLOCKER_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle(titleText)
-            .setContentText(contentText)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setGroup(BLOCKER_GROUP_KEY)
-            .setOnlyAlertOnce(true)
-            .setAutoCancel(true)
-            .build()
-        notificationManager.notify(pkgOrUrl.hashCode(), notification)
-
-        val summary = NotificationCompat.Builder(this, BLOCKER_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setGroup(BLOCKER_GROUP_KEY)
-            .setGroupSummary(true)
-            .setOnlyAlertOnce(true)
-            .setSilent(true)
-            .build()
-        notificationManager.notify(NotificationHelper.BLOCKER_SUMMARY_ID, summary)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun showFocusModeNotification(pkg: String) {
-        if (!notificationManager.areNotificationsEnabled()) return
-        if (!prefs.getBoolean("focus_reminders", true)) return
-        val appName = try {
-            packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0))
-        } catch (_: PackageManager.NameNotFoundException) {
-            pkg
-        }
-        val notification = NotificationCompat.Builder(this, BLOCKER_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle(getString(R.string.distraction_blocked))
-            .setContentText(getString(R.string.you_were_using, appName))
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setOnlyAlertOnce(true)
-            .setAutoCancel(true)
-            .build()
-        notificationManager.notify("focus_$pkg".hashCode(), notification)
-    }
-
-    override fun onInterrupt() {}
-
-    override fun onUnbind(intent: Intent?): Boolean {
-        isBound = false
-        cleanupConnection()
-        return true
-    }
-
-    override fun onRebind(intent: Intent?) {
-        super.onRebind(intent)
-        isBound = true
-        lastEventEpochMs = System.currentTimeMillis()
-    }
-
-    override fun onDestroy() {
-        isBound = false
-        cleanupConnection()
-        super.onDestroy()
-    }
-
-    private fun cleanupConnection() {
-        _connectionState.value = false
-        if (screenReceiverRegistered) {
-            try {
-                unregisterReceiver(screenReceiver)
-            } catch (_: IllegalArgumentException) {
-            }
-            screenReceiverRegistered = false
-        }
-        handler.removeCallbacks(websiteLimitPollRunnable)
-        handler.removeCallbacks(routinePollRunnable)
-        handler.removeCallbacks(budgetTickRunnable)
-        handler.removeCallbacks(pendingBudgetStop)
-        budgetPackage = null
-        NotificationHelper.cancelBudgetNotification(this)
-        foregroundPackage = null
-        enforcedForegroundPackage = null
-        activeBrowserPackage = null
-        activeBrowserConfig = null
-        WebsiteUsageTracker.stopTracking()
-    }
-
-    companion object {
-        private const val ROUTINE_POLL_INTERVAL_MS = 30_000L
-        private const val APP_CHECK_DEBOUNCE_MS = 500L
-        private const val BUDGET_TICK_INTERVAL_MS = 60_000L
-        private const val BUDGET_STOP_DELAY_MS = 3_000L
-
-        /**
-         * Windows that briefly steal the foreground while another app is being opened or
-         * while the notification shade is pulled down. They must never be treated as
-         * "the user switched to another app", otherwise the countdown notification is
-         * cancelled the instant it appears.
-         */
-        private val TRANSIENT_PACKAGES = setOf(
-            "com.android.systemui",
-            "com.android.packageinstaller",
-            "com.google.android.packageinstaller",
-            "com.android.permissioncontroller",
-            "com.google.android.permissioncontroller",
-            "android"
+        val session = ActiveSession(
+            routineId = routine.id,
+            startTime = startTime,
+            endTime = endTime,
+            isManual = routine.schedule.type == RoutineSchedule.ScheduleType.MANUAL,
+            limits = limits,
+            sharedGroups = sharedGroups
         )
+        sessions.add(session)
+        saveActiveSessions(sessions)
 
-        @Volatile
-        var isBound: Boolean = false
+        Log.d(
+            TAG,
+            "Started session for ${routine.name}: ${limits.size} limits, ${sharedGroups.size} groups, endTime=${if (endTime == 0L) "never" else endTime}"
+        )
+        if (endTime > 0L) {
+            RoutineAlarmScheduler.scheduleEnd(context, routine.id, endTime)
+        }
+        NotificationHelper.syncRoutineNotification(context)
+    }
 
-        @Volatile
-        var lastEventEpochMs: Long = 0L
+    private fun stopSessionInternal(context: Context, routineId: String) {
+        val sessions = getActiveSessions().toMutableList()
+        val removed = sessions.removeAll { it.routineId == routineId }
 
-        private val _connectionState = MutableStateFlow(false)
-        val connectionState: StateFlow<Boolean> = _connectionState.asStateFlow()
+        if (removed) {
+            saveActiveSessions(sessions)
+            NotificationHelper.syncRoutineNotification(context)
+            Log.d(TAG, "Stopped session: $routineId. Remaining: ${sessions.size}")
+        }
+    }
 
-        val isConnected: Boolean
-            get() = _connectionState.value && isBound
+    private fun buildLimitsMap(routine: Routine): Map<String, Long> {
+        val limits = mutableMapOf<String, Long>()
+        routine.limits.forEach { limits[it.packageName] = it.limitMinutes * 60_000L }
+        routine.groups
+            .filter { it.type == Routine.AppGroup.GroupType.INDIVIDUAL }
+            .forEach { group ->
+                group.individualLimits.forEach { (pkg, minutes) ->
+                    limits[pkg] = minutes * 60_000L
+                }
+            }
+        return limits
+    }
+
+    private fun buildSharedGroups(routine: Routine): List<SharedGroupSession> {
+        return routine.groups
+            .filter { it.type == Routine.AppGroup.GroupType.SHARED }
+            .map { group ->
+                SharedGroupSession(
+                    groupId = group.id,
+                    packageNames = group.packageNames,
+                    sharedLimitMs = group.sharedLimitMinutes * 60_000L
+                )
+            }
+    }
+
+    fun getActiveSessions(): List<ActiveSession> {
+        cachedSessions?.let { return it }
+        val loaded = loadSessions()
+        cachedSessions = loaded
+        return loaded
+    }
+
+    fun getLimitMs(packageName: String): Long? {
+        val now = System.currentTimeMillis()
+        val sessions = getActiveSessions().filter { it.endTime == 0L || now < it.endTime }
+        if (sessions.isEmpty()) return null
+
+        var strictestLimit: Long? = null
+
+        for (session in sessions) {
+            val individualLimit = session.limits[packageName]
+            if (individualLimit != null) {
+                strictestLimit =
+                    strictestLimit?.let { minOf(it, individualLimit) } ?: individualLimit
+            }
+
+            for (group in session.sharedGroups) {
+                if (packageName in group.packageNames) {
+                    strictestLimit = strictestLimit?.let { minOf(it, group.sharedLimitMs) }
+                        ?: group.sharedLimitMs
+                }
+            }
+        }
+
+        return strictestLimit
+    }
+
+    fun getUsageMs(context: Context, packageName: String): Long {
+        val now = System.currentTimeMillis()
+        val sessions = getActiveSessions().filter { it.endTime == 0L || now < it.endTime }
+        if (sessions.isEmpty()) return 0L
+
+        val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+        var maxUsage = 0L
+
+        for (session in sessions) {
+            val sharedGroup = session.sharedGroups.find { packageName in it.packageNames }
+
+            if (sharedGroup != null) {
+                val groupUsage = sharedGroup.packageNames.sumOf { pkg ->
+                    ScreenUsageHelper.fetchUsageInMs(
+                        usm,
+                        session.startTime,
+                        System.currentTimeMillis(),
+                        pkg
+                    )[pkg] ?: 0L
+                }
+                if (groupUsage > maxUsage) maxUsage = groupUsage
+            } else if (session.limits.containsKey(packageName)) {
+                val usage = ScreenUsageHelper.fetchUsageInMs(
+                    usm, session.startTime, System.currentTimeMillis(), packageName
+                )[packageName] ?: 0L
+                if (usage > maxUsage) maxUsage = usage
+            }
+        }
+
+        return maxUsage
+    }
+
+    /**
+     * Remaining budget for [packageName] inside the currently running routine window(s),
+     * in milliseconds.
+     *
+     * Returns `null` when no active routine limits this package at all, which is also the
+     * case outside every routine window - callers use that to decide whether the
+     * "time left" notification should be shown at all.
+     *
+     * Returns 0 (never negative) once the budget has been used up.
+     */
+    fun getRemainingMs(context: Context, packageName: String): Long? {
+        val limitMs = getLimitMs(packageName) ?: return null
+        val usageMs = getUsageMs(context, packageName)
+        return (limitMs - usageMs).coerceAtLeast(0L)
+    }
+
+    fun updateSessionLimits(routine: Routine) {
+        val sessions = getActiveSessions().toMutableList()
+        val index = sessions.indexOfFirst { it.routineId == routine.id }
+        if (index < 0) return
+
+        val old = sessions[index]
+        sessions[index] = old.copy(
+            limits = buildLimitsMap(routine),
+            sharedGroups = buildSharedGroups(routine)
+        )
+        saveActiveSessions(sessions)
+    }
+
+    fun hasActiveSession(routineId: String): Boolean {
+        return getActiveSessions().any { it.routineId == routineId }
+    }
+
+    fun getActiveRoutineNames(): List<String> {
+        val sessions = getActiveSessions()
+        return sessions.mapNotNull { session ->
+            dev.pranav.reef.routine.Routines.get(session.routineId)?.name
+        }
+    }
+
+    private fun saveActiveSessions(sessions: List<ActiveSession>) {
+        val json = JSONArray().apply {
+            sessions.forEach { session ->
+                put(JSONObject().apply {
+                    put("routineId", session.routineId)
+                    put("startTime", session.startTime)
+                    put("endTime", session.endTime)
+                    put("isManual", session.isManual)
+                    put("limits", JSONObject().apply {
+                        session.limits.forEach { (pkg, limit) -> put(pkg, limit) }
+                    })
+                    put("sharedGroups", JSONArray().apply {
+                        session.sharedGroups.forEach { group ->
+                            put(JSONObject().apply {
+                                put("groupId", group.groupId)
+                                put("packageNames", JSONArray().apply {
+                                    group.packageNames.forEach { put(it) }
+                                })
+                                put("sharedLimitMs", group.sharedLimitMs)
+                            })
+                        }
+                    })
+                })
+            }
+        }
+        prefs.edit { putString(ACTIVE_SESSIONS_KEY, json.toString()) }
+        cachedSessions = sessions
+    }
+
+    private fun loadSessions(): List<ActiveSession> {
+        val json = prefs.getString(ACTIVE_SESSIONS_KEY, "[]") ?: "[]"
+        return try {
+            val arr = JSONArray(json)
+            (0 until arr.length()).mapNotNull { i ->
+                try {
+                    val obj = arr.getJSONObject(i)
+                    val limitsJson = obj.getJSONObject("limits")
+                    val limits = mutableMapOf<String, Long>()
+                    limitsJson.keys().forEach { key -> limits[key] = limitsJson.getLong(key) }
+
+                    val sharedGroups = obj.optJSONArray("sharedGroups")?.let { groupArr ->
+                        (0 until groupArr.length()).mapNotNull { gi ->
+                            try {
+                                val g = groupArr.getJSONObject(gi)
+                                val pkgs = g.getJSONArray("packageNames").let { pkgArr ->
+                                    (0 until pkgArr.length()).map { j -> pkgArr.getString(j) }
+                                }
+                                SharedGroupSession(
+                                    groupId = g.getString("groupId"),
+                                    packageNames = pkgs,
+                                    sharedLimitMs = g.getLong("sharedLimitMs")
+                                )
+                            } catch (_: Exception) {
+                                null
+                            }
+                        }
+                    } ?: emptyList()
+
+                    ActiveSession(
+                        routineId = obj.getString("routineId"),
+                        startTime = obj.getLong("startTime"),
+                        endTime = obj.optLong("endTime", 0L),
+                        isManual = obj.optBoolean("isManual", false),
+                        limits = limits,
+                        sharedGroups = sharedGroups
+                    )
+                } catch (_: Exception) {
+                    null
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun invalidateCache() {
+        cachedSessions = null
     }
 }
