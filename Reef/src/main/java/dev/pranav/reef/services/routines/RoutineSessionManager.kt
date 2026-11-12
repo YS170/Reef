@@ -245,6 +245,22 @@ object RoutineSessionManager {
         return maxUsage
     }
 
+    /**
+     * Remaining budget for [packageName] inside the currently running routine window(s),
+     * in milliseconds.
+     *
+     * Returns `null` when no active routine limits this package at all, which is also the
+     * case outside every routine window - callers use that to decide whether the
+     * "time left" notification should be shown at all.
+     *
+     * Returns 0 (never negative) once the budget has been used up.
+     */
+    fun getRemainingMs(context: Context, packageName: String): Long? {
+        val limitMs = getLimitMs(packageName) ?: return null
+        val usageMs = getUsageMs(context, packageName)
+        return (limitMs - usageMs).coerceAtLeast(0L)
+    }
+
     fun updateSessionLimits(routine: Routine) {
         val sessions = getActiveSessions().toMutableList()
         val index = sessions.indexOfFirst { it.routineId == routine.id }

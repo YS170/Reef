@@ -16,6 +16,7 @@ import dev.pranav.reef.services.routines.RoutineSessionManager
 
 object NotificationHelper {
     const val ROUTINE_STATUS_NOTIFICATION_ID = 5001
+    const val ROUTINE_BUDGET_NOTIFICATION_ID = 5002
     private const val REMINDER_NOTIFICATION_ID = 200
 
     const val BLOCKER_GROUP_KEY = "dev.pranav.reef.BLOCKER_GROUP"
@@ -67,6 +68,19 @@ object NotificationHelper {
                 setBypassDnd(true)
             }
         )
+        // Silent, but with a status bar icon: shows the remaining routine budget of the
+        // app currently in the foreground.
+        notificationManager.createNotificationChannel(
+            NotificationChannel(
+                ROUTINE_BUDGET_CHANNEL_ID,
+                "剩余可用时间",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "专注时间段内显示当前应用的剩余可用时间"
+                setShowBadge(false)
+                setSound(null, null)
+            }
+        )
     }
 
     fun syncRoutineNotification(context: Context) {
@@ -112,6 +126,48 @@ object NotificationHelper {
             .build()
 
         manager.notify(ROUTINE_STATUS_NOTIFICATION_ID, notification)
+    }
+
+    /**
+     * Shows (or updates in place) the ongoing "how much longer can I use this app" notification
+     * for [packageName]. Silent, non-dismissible by the user, refreshed roughly once a minute by
+     * BlockerService.
+     */
+    fun showBudgetNotification(context: Context, packageName: String, remainingMs: Long) {
+        if (ActivityCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) return
+
+        val appName = try {
+            context.packageManager.getApplicationLabel(
+                context.packageManager.getApplicationInfo(packageName, 0)
+            ).toString()
+        } catch (_: PackageManager.NameNotFoundException) {
+            packageName
+        }
+
+        // Round up: while there is still time left, never show "0 minutes".
+        val minutes = ((remainingMs + 59_999L) / 60_000L).toInt()
+
+        val notification = NotificationCompat.Builder(context, ROUTINE_BUDGET_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle(appName)
+            .setContentText("本段还能玩 $minutes 分钟")
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setShowWhen(false)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+
+        NotificationManagerCompat.from(context)
+            .notify(ROUTINE_BUDGET_NOTIFICATION_ID, notification)
+    }
+
+    fun cancelBudgetNotification(context: Context) {
+        NotificationManagerCompat.from(context).cancel(ROUTINE_BUDGET_NOTIFICATION_ID)
     }
 
     fun showReminderNotification(context: Context, packageName: String, timeRemaining: Long) {

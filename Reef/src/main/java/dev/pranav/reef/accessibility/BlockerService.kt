@@ -52,6 +52,9 @@ class BlockerService : AccessibilityService() {
     private var foregroundPackage: String? = null
     private var enforcedForegroundPackage: String? = null
 
+    /** Package whose remaining routine budget is currently shown in the status bar. */
+    private var budgetPackage: String? = null
+
     private var activeBrowserPackage: String? = null
     private var activeBrowserConfig: BrowserConfig? = null
     private val browserPackages = mutableSetOf<String>()
@@ -61,6 +64,7 @@ class BlockerService : AccessibilityService() {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_OFF -> {
                     WebsiteUsageTracker.stopTracking()
+                    stopBudgetTicker()
                 }
 
                 Intent.ACTION_USER_PRESENT, Intent.ACTION_SCREEN_ON -> {
@@ -106,10 +110,20 @@ class BlockerService : AccessibilityService() {
             try {
                 RoutineSessionManager.evaluateAndSync(this@BlockerService)
                 syncRoutineNotification(this@BlockerService)
+                // A routine window may have just ended (or been disabled): drop the
+                // "time left" notification if it no longer applies.
+                refreshBudgetNotification()
             } catch (e: Exception) {
                 Log.e("BlockerService", "Routine poll error", e)
             }
             handler.postDelayed(this, ROUTINE_POLL_INTERVAL_MS)
+        }
+    }
+
+    private val budgetTickRunnable = object : Runnable {
+        override fun run() {
+            refreshBudgetNotification()
+            handler.postDelayed(this, BUDGET_TICK_INTERVAL_MS)
         }
     }
 
@@ -189,6 +203,14 @@ class BlockerService : AccessibilityService() {
             if (foregroundPackage != pkg) {
                 foregroundPackage = pkg
                 enforcedForegroundPackage = null
+            }
+
+            // Keep a silent, ongoing "X minutes left" notification in sync with whatever
+            // app is actually in the foreground.
+            if (pkg == packageName) {
+                stopBudgetTicker()
+            } else {
+                startBudgetTicker(pkg)
             }
 
             if (!browserPackages.contains(pkg)) {
@@ -282,6 +304,33 @@ class BlockerService : AccessibilityService() {
             lastAppCheckAtMs = now
         }
         return !isDuplicate
+    }
+
+    private fun startBudgetTicker(pkg: String) {
+        if (budgetPackage == pkg) {
+            refreshBudgetNotification()
+            return
+        }
+        budgetPackage = pkg
+        handler.removeCallbacks(budgetTickRunnable)
+        refreshBudgetNotification()
+        handler.postDelayed(budgetTickRunnable, BUDGET_TICK_INTERVAL_MS)
+    }
+
+    private fun stopBudgetTicker() {
+        budgetPackage = null
+        handler.removeCallbacks(budgetTickRunnable)
+        NotificationHelper.cancelBudgetNotification(this)
+    }
+
+    private fun refreshBudgetNotification() {
+        val pkg = budgetPackage ?: return
+        val remainingMs = RoutineSessionManager.getRemainingMs(this, pkg)
+        if (remainingMs == null || remainingMs <= 0L) {
+            NotificationHelper.cancelBudgetNotification(this)
+        } else {
+            NotificationHelper.showBudgetNotification(this, pkg, remainingMs)
+        }
     }
 
     private fun refreshBrowserPackages() {
@@ -543,6 +592,9 @@ class BlockerService : AccessibilityService() {
         }
         handler.removeCallbacks(websiteLimitPollRunnable)
         handler.removeCallbacks(routinePollRunnable)
+        handler.removeCallbacks(budgetTickRunnable)
+        budgetPackage = null
+        NotificationHelper.cancelBudgetNotification(this)
         foregroundPackage = null
         enforcedForegroundPackage = null
         activeBrowserPackage = null
@@ -553,6 +605,7 @@ class BlockerService : AccessibilityService() {
     companion object {
         private const val ROUTINE_POLL_INTERVAL_MS = 30_000L
         private const val APP_CHECK_DEBOUNCE_MS = 500L
+        private const val BUDGET_TICK_INTERVAL_MS = 60_000L
 
         @Volatile
         var isBound: Boolean = false
