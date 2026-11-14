@@ -22,14 +22,28 @@ jobs:
       - name: Give permission to executable
         run: chmod +x gradlew
 
-      # Keeps the debug signing key stable between builds. Without this, every build gets a
-      # brand new throwaway key, so an APK can never be installed over a previous one - the
-      # user has to uninstall first, which wipes app data and all granted permissions.
-      - name: Cache debug keystore
+      # A stable signing key. Without it every build is signed with a brand new throwaway
+      # key, so an APK can never be installed over a previous one - the user has to
+      # uninstall, which wipes routines and every granted permission.
+      - name: Restore debug keystore
         uses: actions/cache@v4
         with:
-          path: ~/.android
-          key: android-debug-keystore-v1
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v2
+
+      - name: Create debug keystore if missing
+        run: |
+          KEYSTORE="$HOME/.android/debug.keystore"
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$KEYSTORE" ]; then
+            echo "no cached keystore, generating one"
+            keytool -genkeypair -keystore "$KEYSTORE" -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          else
+            echo "restored cached keystore"
+          fi
+          keytool -list -keystore "$KEYSTORE" -storepass android | head -3
 
       # FIX 1: the action's default package list is "tools platform-tools", but Google
       # removed the "tools" package from the SDK repository, which makes sdkmanager
