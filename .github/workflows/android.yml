@@ -22,6 +22,15 @@ jobs:
       - name: Give permission to executable
         run: chmod +x gradlew
 
+      # Keeps the debug signing key stable between builds. Without this, every build gets a
+      # brand new throwaway key, so an APK can never be installed over a previous one - the
+      # user has to uninstall first, which wipes app data and all granted permissions.
+      - name: Cache debug keystore
+        uses: actions/cache@v4
+        with:
+          path: ~/.android
+          key: android-debug-keystore-v1
+
       # FIX 1: the action's default package list is "tools platform-tools", but Google
       # removed the "tools" package from the SDK repository, which makes sdkmanager
       # fail with "Failed to find package 'tools'". Only ask for platform-tools.
