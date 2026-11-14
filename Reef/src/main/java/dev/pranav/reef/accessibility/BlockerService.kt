@@ -77,6 +77,10 @@ class BlockerService : AccessibilityService() {
     /** Guards against re-posting the "overlay failed" diagnostic on every refresh. */
     private var overlayFailureReported = false
 
+    /** Throttle bookkeeping for the budget tracking that now runs on every event type. */
+    private var lastBudgetEventPkg: String? = null
+    private var lastBudgetEventAt = 0L
+
     private var activeBrowserPackage: String? = null
     private var activeBrowserConfig: BrowserConfig? = null
     private val browserPackages = mutableSetOf<String>()
@@ -222,20 +226,24 @@ class BlockerService : AccessibilityService() {
 
         val pkg = event.packageName?.toString() ?: return
 
+        // Diagnostics: which event types does this ROM actually deliver?
+        Log.d(DEBUG_TAG, "event type=${event.eventType} pkg=$pkg")
+
+        // Some ROMs deliver only TYPE_WINDOW_CONTENT_CHANGED for app switches, so the budget
+        // tracking must not depend on TYPE_WINDOW_STATE_CHANGED alone. Throttled to one call
+        // per package change plus every two seconds.
+        val nowMs = SystemClock.elapsedRealtime()
+        if (pkg != lastBudgetEventPkg || nowMs - lastBudgetEventAt > 2_000L) {
+            lastBudgetEventPkg = pkg
+            lastBudgetEventAt = nowMs
+            onForegroundApp(pkg)
+        }
+
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             if (foregroundPackage != pkg) {
                 foregroundPackage = pkg
                 enforcedForegroundPackage = null
             }
-
-            // Keep a silent, ongoing "X minutes left" notification in sync with whatever
-            // app is actually in the foreground. Window-state events are extremely noisy:
-            // opening an app, pulling down the shade, or a system dialog all report some
-            // other window for a moment, and on MIUI/HyperOS the app and its system
-            // overlays can alternate several times per second. Reacting to every one of
-            // those made the notification flash (cancel + recreate in a loop), so the
-            // "you left the app" decision is deferred instead of taken immediately.
-            onForegroundApp(pkg)
 
             if (!browserPackages.contains(pkg)) {
                 WebsiteUsageTracker.stopTracking()
@@ -839,6 +847,7 @@ class BlockerService : AccessibilityService() {
     }
 
     companion object {
+        private const val DEBUG_TAG = "REEFDBG"
         private const val ROUTINE_POLL_INTERVAL_MS = 30_000L
         private const val APP_CHECK_DEBOUNCE_MS = 500L
         private const val BUDGET_TICK_INTERVAL_MS = 60_000L
