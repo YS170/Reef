@@ -4,6 +4,8 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.annotation.SuppressLint
 import android.app.KeyguardManager
+import android.app.usage.UsageEvents
+import android.app.usage.UsageStatsManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -81,6 +83,9 @@ class BlockerService : AccessibilityService() {
     private var lastBudgetEventPkg: String? = null
     private var lastBudgetEventAt = 0L
 
+    /** Last package seen by the foreground poller. */
+    private var lastPolledPackage: String? = null
+
     /** Worker used so UsageStatsManager queries never block the accessibility callback. */
     private val budgetExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
 
@@ -156,6 +161,43 @@ class BlockerService : AccessibilityService() {
         }
     }
 
+    /**
+     * Polls the foreground app instead of waiting for accessibility events. On some ROMs the
+     * accessibility stream stops after a few seconds while the service stays "bound", which
+     * made the pill die silently. UsageStats keeps working in that situation.
+     */
+    private val foregroundPollRunnable = object : Runnable {
+        override fun run() {
+            try {
+                pollForegroundPackage()
+            } catch (e: Exception) {
+                diag("poll error ${e.javaClass.simpleName}")
+            }
+            handler.postDelayed(this, FOREGROUND_POLL_MS)
+        }
+    }
+
+    private fun pollForegroundPackage() {
+        val usm = getSystemService(USAGE_STATS_SERVICE) as UsageStatsManager
+        val now = System.currentTimeMillis()
+        val events = usm.queryEvents(now - 15_000L, now) ?: return
+        var candidate: String? = null
+        val event = UsageEvents.Event()
+        while (events.hasNextEvent()) {
+            events.getNextEvent(event)
+            // MOVE_TO_FOREGROUND and ACTIVITY_RESUMED share the same value.
+            if (event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND) {
+                candidate = event.packageName
+            }
+        }
+        val pkg = candidate ?: return
+        if (pkg == packageName) return
+        if (pkg == lastPolledPackage) return
+        lastPolledPackage = pkg
+        diag("poll $pkg")
+        onForegroundApp(pkg)
+    }
+
     private data class BrowserConfig(
         val urlBarId: String,
         val suggestionBoxId: String,
@@ -209,8 +251,10 @@ class BlockerService : AccessibilityService() {
 
         handler.removeCallbacks(routinePollRunnable)
         handler.removeCallbacks(websiteLimitPollRunnable)
+        handler.removeCallbacks(foregroundPollRunnable)
         handler.post(routinePollRunnable)
         handler.post(websiteLimitPollRunnable)
+        handler.post(foregroundPollRunnable)
         _connectionState.value = true
     }
 
@@ -920,6 +964,7 @@ class BlockerService : AccessibilityService() {
         handler.removeCallbacks(websiteLimitPollRunnable)
         handler.removeCallbacks(routinePollRunnable)
         handler.removeCallbacks(budgetTickRunnable)
+        handler.removeCallbacks(foregroundPollRunnable)
         removeBudgetOverlay()
         budgetPackage = null
         NotificationHelper.cancelBudgetNotification(this)
@@ -934,6 +979,7 @@ class BlockerService : AccessibilityService() {
         private const val DEBUG_TAG = "REEFDBG"
         private const val KEEP_ALIVE_NOTIFICATION_ID = 6001
         private const val ROUTINE_POLL_INTERVAL_MS = 30_000L
+        private const val FOREGROUND_POLL_MS = 3_000L
         private const val APP_CHECK_DEBOUNCE_MS = 500L
         private const val BUDGET_TICK_INTERVAL_MS = 60_000L
 
