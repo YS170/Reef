@@ -232,8 +232,15 @@ class BlockerService : AccessibilityService() {
         // Some ROMs deliver only TYPE_WINDOW_CONTENT_CHANGED for app switches, so the budget
         // tracking must not depend on TYPE_WINDOW_STATE_CHANGED alone. Throttled to one call
         // per package change plus every two seconds.
+        //
+        // Our own package is deliberately excluded here: Reef's background UI keeps emitting
+        // content-change events, and treating those as "the user came back to Reef" made the
+        // pill alternate between added and removed several times per second (visible flicker).
+        // Reef itself is handled on real window-state changes further down.
         val nowMs = SystemClock.elapsedRealtime()
-        if (pkg != lastBudgetEventPkg || nowMs - lastBudgetEventAt > 2_000L) {
+        if (pkg != packageName &&
+            (pkg != lastBudgetEventPkg || nowMs - lastBudgetEventAt > 2_000L)
+        ) {
             lastBudgetEventPkg = pkg
             lastBudgetEventAt = nowMs
             onForegroundApp(pkg)
@@ -243,6 +250,11 @@ class BlockerService : AccessibilityService() {
             if (foregroundPackage != pkg) {
                 foregroundPackage = pkg
                 enforcedForegroundPackage = null
+            }
+
+            // The user really switched to Reef: that is the one signal that hides the pill.
+            if (pkg == packageName) {
+                stopBudgetTicker()
             }
 
             if (!browserPackages.contains(pkg)) {
@@ -382,6 +394,7 @@ class BlockerService : AccessibilityService() {
      * notification seconds after it appeared.
      */
     private fun onForegroundApp(pkg: String) {
+        diag("fg $pkg")
         if (pkg == packageName) {
             stopBudgetTicker()
             return
@@ -425,6 +438,7 @@ class BlockerService : AccessibilityService() {
         handler.removeCallbacks(budgetTickRunnable)
         removeBudgetOverlay()
         NotificationHelper.cancelBudgetNotification(this)
+        diag("stop")
     }
 
     private fun refreshBudgetNotification() {
@@ -453,6 +467,7 @@ class BlockerService : AccessibilityService() {
 
     /** Temporary on-device diagnostics, posted through the blocker channel. */
     private fun debugReport(message: String) {
+        diag(message)
         try {
             val notification = NotificationCompat.Builder(this, BLOCKER_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_launcher_foreground)
@@ -485,7 +500,7 @@ class BlockerService : AccessibilityService() {
         debugReport("尝试显示胶囊: $text")
 
         val existing = budgetOverlay
-        if (existing is TextView) {
+        if (existing is TextView && existing.isAttachedToWindow) {
             existing.text = text
             return
         }
@@ -562,6 +577,17 @@ class BlockerService : AccessibilityService() {
                 .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                 .build()
             NotificationManagerCompat.from(this).notify(9998, notification)
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Appends a line to files/diag.log. MIUI suppresses third-party Logcat output, so this is
+     * the only reliable way to observe the service from `adb shell run-as`.
+     */
+    private fun diag(message: String) {
+        try {
+            java.io.File(filesDir, "diag.log").appendText("${System.currentTimeMillis()} $message\n")
         } catch (_: Exception) {
         }
     }
