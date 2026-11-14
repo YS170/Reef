@@ -17,6 +17,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -72,6 +73,9 @@ class BlockerService : AccessibilityService() {
 
     /** Small always-on-top pill showing the remaining budget of the current app. */
     private var budgetOverlay: View? = null
+
+    /** Guards against re-posting the "overlay failed" diagnostic on every refresh. */
+    private var overlayFailureReported = false
 
     private var activeBrowserPackage: String? = null
     private var activeBrowserConfig: BrowserConfig? = null
@@ -459,39 +463,76 @@ class BlockerService : AccessibilityService() {
         }
         removeBudgetOverlay()
 
-        val view = TextView(this).apply {
-            setText(text)
-            setTextColor(0xFFFFFFFF.toInt())
-            textSize = 12f
-            setPadding(28, 12, 28, 12)
-            background = GradientDrawable().apply {
-                cornerRadius = 40f
-                setColor(0xCC202124.toInt())
+        val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+
+        // Preferred: an accessibility overlay needs no extra permission. Some OEM ROMs
+        // (MIUI among them) refuse it, so fall back to a normal "draw over other apps"
+        // overlay when that permission happens to be granted.
+        val candidates = mutableListOf(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+        if (Settings.canDrawOverlays(this)) {
+            candidates.add(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
+        }
+
+        var lastError: Exception? = null
+        for (type in candidates) {
+            // A fresh view per attempt: a view whose addView() failed must not be reused.
+            val view = TextView(this).apply {
+                setText(text)
+                setTextColor(0xFFFFFFFF.toInt())
+                textSize = 12f
+                setPadding(28, 12, 28, 12)
+                background = GradientDrawable().apply {
+                    cornerRadius = 40f
+                    setColor(0xCC202124.toInt())
+                }
+                isClickable = false
+                isFocusable = false
             }
-            isClickable = false
-            isFocusable = false
+            val params = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                type,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.END
+                x = 24
+                y = 160
+            }
+            try {
+                windowManager.addView(view, params)
+                budgetOverlay = view
+                overlayFailureReported = false
+                return
+            } catch (e: Exception) {
+                lastError = e
+                Log.w("BlockerService", "Overlay type $type rejected", e)
+            }
         }
 
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.END
-            x = 24
-            y = 160
-        }
+        lastError?.let { reportOverlayFailure(it) }
+    }
 
+    /**
+     * Posts a one-off diagnostic through the blocker channel when the pill cannot be shown,
+     * so the failure is visible on the device instead of only in logcat.
+     */
+    private fun reportOverlayFailure(error: Exception) {
+        if (overlayFailureReported) return
+        overlayFailureReported = true
         try {
-            val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-            windowManager.addView(view, params)
-            budgetOverlay = view
-        } catch (e: Exception) {
-            Log.w("BlockerService", "Unable to show the budget overlay", e)
+            val notification = NotificationCompat.Builder(this, BLOCKER_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setContentTitle("悬浮窗没显示出来")
+                .setContentText("${error.javaClass.simpleName}: ${error.message}")
+                .setOnlyAlertOnce(true)
+                .setAutoCancel(false)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .build()
+            NotificationManagerCompat.from(this).notify(9998, notification)
+        } catch (_: Exception) {
         }
     }
 
