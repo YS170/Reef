@@ -435,9 +435,27 @@ class BlockerService : AccessibilityService() {
                 // the accessibility service made the system tear it down with the service.
                 NotificationManagerCompat.from(this)
                     .notify(NotificationHelper.ROUTINE_BUDGET_NOTIFICATION_ID, notification)
+            } else {
+                debugReport("通知构造失败: 可能没给通知权限")
             }
         } catch (e: Exception) {
-            Log.w("BlockerService", "Unable to update the budget indicator", e)
+            debugReport("异常: ${e.javaClass.simpleName} ${e.message}")
+        }
+    }
+
+    /** Temporary on-device diagnostics, posted through the blocker channel. */
+    private fun debugReport(message: String) {
+        try {
+            val notification = NotificationCompat.Builder(this, BLOCKER_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setContentTitle("诊断")
+                .setContentText(message)
+                .setOnlyAlertOnce(true)
+                .setAutoCancel(false)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                .build()
+            NotificationManagerCompat.from(this).notify(9997, notification)
+        } catch (_: Exception) {
         }
     }
 
@@ -455,6 +473,8 @@ class BlockerService : AccessibilityService() {
             pkg
         }
         val text = "$label 还剩 $minutes 分"
+
+        debugReport("尝试显示胶囊: $text")
 
         val existing = budgetOverlay
         if (existing is TextView) {
@@ -505,9 +525,11 @@ class BlockerService : AccessibilityService() {
                 windowManager.addView(view, params)
                 budgetOverlay = view
                 overlayFailureReported = false
+                debugReport("胶囊已添加 type=$type")
                 return
             } catch (e: Exception) {
                 lastError = e
+                debugReport("添加失败 type=$type: ${e.javaClass.simpleName}")
                 Log.w("BlockerService", "Overlay type $type rejected", e)
             }
         }
