@@ -9,6 +9,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -16,8 +18,12 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import dev.pranav.reef.MindfulLaunchActivity
@@ -63,6 +69,9 @@ class BlockerService : AccessibilityService() {
 
     /** Cached answers to "is this a system package". */
     private val systemAppCache = mutableMapOf<String, Boolean>()
+
+    /** Small always-on-top pill showing the remaining budget of the current app. */
+    private var budgetOverlay: View? = null
 
     private var activeBrowserPackage: String? = null
     private var activeBrowserConfig: BrowserConfig? = null
@@ -402,6 +411,7 @@ class BlockerService : AccessibilityService() {
     private fun stopBudgetTicker() {
         budgetPackage = null
         handler.removeCallbacks(budgetTickRunnable)
+        removeBudgetOverlay()
         NotificationHelper.cancelBudgetNotification(this)
     }
 
@@ -413,16 +423,85 @@ class BlockerService : AccessibilityService() {
                 stopBudgetTicker()
                 return
             }
+            updateBudgetOverlay(pkg, remainingMs)
             val notification = NotificationHelper.buildBudgetNotification(this, pkg, remainingMs)
-                ?: return
-            // Plain notification, exactly like the blocker alerts that this device renders
-            // reliably. Deliberately NOT a foreground-service notification: binding it to the
-            // accessibility service made the system tear the notification down together with
-            // the service, which is what the user saw as "it flashes and disappears".
-            NotificationManagerCompat.from(this)
-                .notify(NotificationHelper.ROUTINE_BUDGET_NOTIFICATION_ID, notification)
+            if (notification != null) {
+                // Plain notification, exactly like the blocker alerts that this device renders
+                // reliably. Deliberately NOT a foreground-service notification: binding it to
+                // the accessibility service made the system tear it down with the service.
+                NotificationManagerCompat.from(this)
+                    .notify(NotificationHelper.ROUTINE_BUDGET_NOTIFICATION_ID, notification)
+            }
         } catch (e: Exception) {
-            Log.w("BlockerService", "Unable to update the budget notification", e)
+            Log.w("BlockerService", "Unable to update the budget indicator", e)
+        }
+    }
+
+    /**
+     * Draws (or updates) a small non-interactive pill in the top-right corner showing the
+     * remaining budget. It uses TYPE_ACCESSIBILITY_OVERLAY, which an accessibility service is
+     * allowed to add without the "display over other apps" permission.
+     */
+    private fun updateBudgetOverlay(pkg: String, remainingMs: Long) {
+        val minutes = ((remainingMs + 59_999L) / 60_000L).toInt()
+        val label = try {
+            packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0))
+                .toString()
+        } catch (_: Exception) {
+            pkg
+        }
+        val text = "$label 还剩 $minutes 分"
+
+        val existing = budgetOverlay
+        if (existing is TextView) {
+            existing.text = text
+            return
+        }
+        removeBudgetOverlay()
+
+        val view = TextView(this).apply {
+            setText(text)
+            setTextColor(0xFFFFFFFF.toInt())
+            textSize = 12f
+            setPadding(28, 12, 28, 12)
+            background = GradientDrawable().apply {
+                cornerRadius = 40f
+                setColor(0xCC202124.toInt())
+            }
+            isClickable = false
+            isFocusable = false
+        }
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.END
+            x = 24
+            y = 160
+        }
+
+        try {
+            val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+            windowManager.addView(view, params)
+            budgetOverlay = view
+        } catch (e: Exception) {
+            Log.w("BlockerService", "Unable to show the budget overlay", e)
+        }
+    }
+
+    private fun removeBudgetOverlay() {
+        val view = budgetOverlay ?: return
+        budgetOverlay = null
+        try {
+            val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+            windowManager.removeView(view)
+        } catch (_: Exception) {
         }
     }
 
@@ -687,6 +766,7 @@ class BlockerService : AccessibilityService() {
         handler.removeCallbacks(routinePollRunnable)
         handler.removeCallbacks(budgetTickRunnable)
         budgetPackage = null
+        removeBudgetOverlay()
         NotificationHelper.cancelBudgetNotification(this)
         foregroundPackage = null
         enforcedForegroundPackage = null
