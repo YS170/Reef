@@ -81,6 +81,9 @@ class BlockerService : AccessibilityService() {
     private var lastBudgetEventPkg: String? = null
     private var lastBudgetEventAt = 0L
 
+    /** Worker used so UsageStatsManager queries never block the accessibility callback. */
+    private val budgetExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+
     private var activeBrowserPackage: String? = null
     private var activeBrowserConfig: BrowserConfig? = null
     private val browserPackages = mutableSetOf<String>()
@@ -446,11 +449,29 @@ class BlockerService : AccessibilityService() {
         diag("stop")
     }
 
+    /**
+     * Starts the budget refresh on a worker thread. Querying UsageStatsManager inside the
+     * accessibility callback blocks the main thread; when that happens often enough the
+     * system decides the service is unresponsive and silently stops delivering events to it
+     * (which looked exactly like "the pill works for a second and then never again").
+     */
     private fun refreshBudgetNotification() {
         val pkg = budgetPackage ?: return
+        budgetExecutor.execute {
+            val remainingMs = try {
+                RoutineSessionManager.getRemainingMs(this, pkg)
+            } catch (e: Exception) {
+                diag("remaining error: ${e.javaClass.simpleName}")
+                null
+            }
+            handler.post { applyBudget(pkg, remainingMs) }
+        }
+    }
+
+    /** Main-thread part: draw the pill and post the notification. */
+    private fun applyBudget(pkg: String, remainingMs: Long?) {
         try {
-            val remainingMs = RoutineSessionManager.getRemainingMs(this, pkg) ?: return
-            if (remainingMs <= 0L) {
+            if (remainingMs == null || remainingMs <= 0L) {
                 stopBudgetTicker()
                 return
             }
@@ -867,8 +888,8 @@ class BlockerService : AccessibilityService() {
         handler.removeCallbacks(websiteLimitPollRunnable)
         handler.removeCallbacks(routinePollRunnable)
         handler.removeCallbacks(budgetTickRunnable)
-        budgetPackage = null
         removeBudgetOverlay()
+        budgetPackage = null
         NotificationHelper.cancelBudgetNotification(this)
         foregroundPackage = null
         enforcedForegroundPackage = null
