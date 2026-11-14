@@ -253,7 +253,12 @@ class BlockerService : AccessibilityService() {
             }
 
             // The user really switched to Reef: that is the one signal that hides the pill.
-            if (pkg == packageName) {
+            // Guard against our own overlay: adding the pill produces a window-state event for
+            // our own package too, and treating that as "Reef opened" made the pill remove
+            // itself ~140 ms after being added. Only real activity windows count.
+            if (pkg == packageName &&
+                event.className?.toString()?.contains("Activity") == true
+            ) {
                 stopBudgetTicker()
             }
 
