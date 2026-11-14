@@ -356,7 +356,10 @@ class BlockerService : AccessibilityService() {
      */
     private fun startKeepAliveForeground() {
         try {
-            val notification = NotificationCompat.Builder(this, ROUTINE_BUDGET_CHANNEL_ID)
+            val notification = NotificationCompat.Builder(
+                this,
+                NotificationHelper.ROUTINE_BUDGET_CHANNEL_ID
+            )
                 .setSmallIcon(R.drawable.ic_launcher_foreground)
                 .setContentTitle("Reef")
                 .setContentText("专注计划守护中")
