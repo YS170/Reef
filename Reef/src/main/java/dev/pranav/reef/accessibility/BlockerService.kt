@@ -184,6 +184,7 @@ class BlockerService : AccessibilityService() {
         _connectionState.value = false
         configureService()
         createNotificationChannel()
+        startKeepAliveForeground()
         keyguardManager = getSystemService(KEYGUARD_SERVICE) as KeyguardManager
 
         WebsiteUsageTracker.init(this)
@@ -344,6 +345,30 @@ class BlockerService : AccessibilityService() {
 
         if (shouldCheckApp && shouldHandleAppCheck(pkg)) {
             handleAppBlockCheck(pkg, event.className?.toString())
+        }
+    }
+
+    /**
+     * Raises the process priority so the system does not freeze it while Reef sits in the
+     * background. On MIUI/HyperOS the accessibility binding alone is not enough - the process
+     * gets marked "power idle" (cached-app freezer) and then receives no more accessibility
+     * events at all, which is exactly the "it works for a second, then never again" symptom.
+     */
+    private fun startKeepAliveForeground() {
+        try {
+            val notification = NotificationCompat.Builder(this, ROUTINE_BUDGET_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_launcher_foreground)
+                .setContentTitle("Reef")
+                .setContentText("专注计划守护中")
+                .setOngoing(true)
+                .setSilent(true)
+                .setShowWhen(false)
+                .setPriority(NotificationCompat.PRIORITY_MIN)
+                .build()
+            startForeground(KEEP_ALIVE_NOTIFICATION_ID, notification)
+            diag("foreground ok")
+        } catch (e: Exception) {
+            diag("foreground fail ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -878,6 +903,10 @@ class BlockerService : AccessibilityService() {
 
     private fun cleanupConnection() {
         _connectionState.value = false
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (_: Exception) {
+        }
         if (screenReceiverRegistered) {
             try {
                 unregisterReceiver(screenReceiver)
@@ -900,6 +929,7 @@ class BlockerService : AccessibilityService() {
 
     companion object {
         private const val DEBUG_TAG = "REEFDBG"
+        private const val KEEP_ALIVE_NOTIFICATION_ID = 6001
         private const val ROUTINE_POLL_INTERVAL_MS = 30_000L
         private const val APP_CHECK_DEBOUNCE_MS = 500L
         private const val BUDGET_TICK_INTERVAL_MS = 60_000L
